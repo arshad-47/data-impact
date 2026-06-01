@@ -1,5 +1,5 @@
 import pandas as pd
-from psycopg2.extras import Json
+from psycopg2.extras import Json, execute_values
 
 from db import get_connection
 from utils import (
@@ -108,9 +108,9 @@ def record_upload(cursor, user, upload_type, file_name, status, stats, failed_ro
         """
         INSERT INTO upload_history (
             uploaded_by, username, upload_type, file_name, status, stats,
-            failed_rows, completed_at
+            failed_rows, created_at, completed_at
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, NOW());
+        VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW());
         """,
         (
             user["user_id"],
@@ -175,17 +175,40 @@ def process_upload(uploaded_file, upload_type, user):
 def process_project_status_upload(dataframe, file_name, upload_type, user):
     stats = base_stats("repeteed_projectids_skipped")
     stats["total_rows_in_csv"] = len(dataframe)
+
     failed_rows = []
     inserted_groups = {}
     seen_project_ids = set()
+    rows_to_insert = []
 
     with get_connection() as connection:
         with connection:
             with connection.cursor() as cursor:
+                csv_project_ids = []
+
+                for _, row in dataframe.iterrows():
+                    project_id = clean_project_id(row.get("Project ID"))
+
+                    if project_id:
+                        csv_project_ids.append(project_id)
+
+                cursor.execute(
+                    """
+                    SELECT id
+                    FROM project_statuses
+                    WHERE id = ANY(%s)
+                    """,
+                    (csv_project_ids,),
+                )
+
+                existing_project_ids = {row[0] for row in cursor.fetchall()}
+
                 for index, row in dataframe.iterrows():
+
                     row_number = index + 2
                     project_id = clean_project_id(row.get("Project ID"))
-                    user_uuid = clean_uuid(row.get("UUID"))
+                    user_uuid = clean_uuid( row.get("UUID"))
+
                     program_name = clean_string(row.get("Program Name"))
                     state = clean_string(row.get("Declared State"))
                     district = clean_string(row.get("District"))
@@ -193,19 +216,13 @@ def process_project_status_upload(dataframe, file_name, upload_type, user):
 
                     if project_id is None:
                         failed_rows.append(
-                            {"row_number": row_number, "row_data": row.to_dict(), "reason": "Invalid or missing Project ID"}
+                            {
+                                "row_number": row_number,
+                                "row_data": row.to_dict(),
+                                "reason": "Invalid or missing Project ID",
+                            }
                         )
                         stats["failed_insertion"] += 1
-                        continue
-
-                    if project_id in seen_project_ids:
-                        stats["repeteed_projectids_skipped"] += 1
-                        continue
-
-                    seen_project_ids.add(project_id)
-                    cursor.execute("SELECT 1 FROM project_statuses WHERE id = %s LIMIT 1;", (project_id,))
-                    if cursor.fetchone():
-                        stats["repeteed_projectids_skipped"] += 1
                         continue
 
                     if not program_name or not state:
@@ -219,73 +236,101 @@ def process_project_status_upload(dataframe, file_name, upload_type, user):
                         stats["failed_insertion"] += 1
                         continue
 
-                    begin_row_savepoint(cursor)
-                    try:
-                        cursor.execute(
-                            """
-                            INSERT INTO project_statuses (
-                                id, user_uuid, user_type, user_sub_type, declared_state, district,
-                                block, school_name, school_id, declared_board, org_name,
-                                program_name, program_id, project_id, project_title,
-                                project_objective, project_start_date_user,
-                                project_completion_date_user, project_duration,
-                                project_last_synced_date, project_status, certificate_status
-                            )
-                            VALUES (
-                                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
-                            );
-                            """,
-                            (
-                                project_id,
-                                user_uuid,
-                                clean_string(row.get("User Type")),
-                                clean_string(row.get("User sub type")),
-                                state,
-                                district,
-                                clean_string(row.get("Block")),
-                                clean_string(row.get("School Name")),
-                                clean_string(row.get("School ID")),
-                                clean_string(row.get("Declared Board")),
-                                clean_string(row.get("Org Name")),
-                                program_name,
-                                clean_string(row.get("Program ID")),
-                                project_id,
-                                clean_string(row.get("Project Title")),
-                                clean_string(row.get("Project Objective")),
-                                clean_string(row.get("Project start date of the user")),
-                                clean_string(row.get("Project completion date of the user")),
-                                clean_string(row.get("Project Duration")),
-                                clean_string(row.get("Project last Synced date")),
-                                status,
-                                clean_string(row.get("Certificate Status")),
-                            ),
-                        )
-                    except Exception as exc:
-                        rollback_row_savepoint(cursor)
-                        failed_rows.append({"row_number": row_number, "row_data": row.to_dict(), "reason": str(exc)})
-                        stats["failed_insertion"] += 1
+                    if project_id in seen_project_ids:
+                        stats["repeteed_projectids_skipped"] += 1
                         continue
-                    else:
-                        release_row_savepoint(cursor)
+
+                    seen_project_ids.add(project_id)
+
+                    if project_id in existing_project_ids:
+                        stats["repeteed_projectids_skipped"] += 1
+                        continue
+
+                    rows_to_insert.append(
+                        (
+                            project_id,
+                            user_uuid,
+                            clean_string(row.get("User Type")),
+                            clean_string(row.get("User sub type")),
+                            state,
+                            district,
+                            clean_string(row.get("Block")),
+                            clean_string(row.get("School Name")),
+                            clean_string(row.get("School ID")),
+                            clean_string(row.get("Declared Board")),
+                            clean_string(row.get("Org Name")),
+                            program_name,
+                            clean_string(row.get("Program ID")),
+                            project_id,
+                            clean_string(row.get("Project Title")),
+                            clean_string(row.get("Project Objective")),
+                            clean_string(row.get("Project start date of the user")),
+                            clean_string(row.get("Project completion date of the user")),
+                            clean_string(row.get("Project Duration")),
+                            clean_string(row.get("Project last Synced date")),
+                            status,
+                            clean_string(row.get("Certificate Status")),
+                        )
+                    )
 
                     stats["sucessfully_insereted"] += 1
-                    group_key = (program_name, state, district)
+
+                    group_key = (
+                        program_name,
+                        state,
+                        district,
+                    )
+
                     if group_key not in inserted_groups:
-                        inserted_groups[group_key] = {"started": 0, "in_progress": 0, "submitted": 0}
+                        inserted_groups[group_key] = {
+                            "started": 0,
+                            "in_progress": 0,
+                            "submitted": 0,
+                        }
+
                     if status in inserted_groups[group_key]:
                         inserted_groups[group_key][status] += 1
 
-                upsert_program_aggregates(cursor, inserted_groups)
-                record_upload(
+                if rows_to_insert:
+                    execute_values(
+                        cursor,
+                        """
+                        INSERT INTO project_statuses (
+                            id,
+                            user_uuid,
+                            user_type,
+                            user_sub_type,
+                            declared_state,
+                            district,
+                            block,
+                            school_name,
+                            school_id,
+                            declared_board,
+                            org_name,
+                            program_name,
+                            program_id,
+                            project_id,
+                            project_title,
+                            project_objective,
+                            project_start_date_user,
+                            project_completion_date_user,
+                            project_duration,
+                            project_last_synced_date,
+                            project_status,
+                            certificate_status
+                        )
+                        VALUES %s
+                        """,
+                        rows_to_insert,
+                        page_size=1000,
+                    )
+
+                upsert_program_aggregates(
                     cursor,
-                    user,
-                    upload_type,
-                    file_name,
-                    upload_status(failed_rows),
-                    stats,
-                    failed_rows,
+                    inserted_groups
                 )
+                
+                record_upload( cursor, user, upload_type, file_name, upload_status(failed_rows), stats, failed_rows,)
 
     return stats, failed_rows
 
@@ -340,6 +385,46 @@ def upsert_program_aggregates(cursor, inserted_groups):
                 ),
             )
 
+from pathlib import Path
+
+
+def update_historical_program_flags(cursor):
+    """
+    Updates historical_program flag based on
+    fixed_program/only_VAM_PreVAM.csv
+    """
+
+    csv_path = (
+        Path(__file__).resolve().parent
+        / "fixed_program"
+        / "only_VAM_PreVAM.csv"
+    )
+
+    if not csv_path.exists():
+        return
+
+    historical_df = pd.read_csv(csv_path)
+
+    historical_programs = {
+        str(program).strip().lower()
+        for program in historical_df["Program Name"].dropna()
+    }
+
+    cursor.execute(
+        """
+        UPDATE program_data
+        SET historical_program = FALSE
+        """
+    )
+
+    cursor.execute(
+        """
+        UPDATE program_data
+        SET historical_program = TRUE
+        WHERE lower(trim(program_name)) = ANY(%s)
+        """,
+        (list(historical_programs),)
+    )
 
 def process_historical_before_upload(dataframe, file_name, upload_type, user):
     stats = base_stats("repeteed_programs_skipped")
@@ -402,6 +487,7 @@ def process_historical_before_upload(dataframe, file_name, upload_type, user):
                         release_row_savepoint(cursor)
                         stats["sucessfully_insereted"] += 1
 
+                update_historical_program_flags(cursor)
                 record_upload(cursor, user, upload_type, file_name, upload_status(failed_rows), stats, failed_rows)
 
     return stats, failed_rows
@@ -469,6 +555,7 @@ def process_historical_after_upload(dataframe, file_name, upload_type, user):
                         release_row_savepoint(cursor)
                         stats["sucessfully_insereted"] += 1
 
+                update_historical_program_flags(cursor)
                 record_upload(cursor, user, upload_type, file_name, upload_status(failed_rows), stats, failed_rows)
 
     return stats, failed_rows

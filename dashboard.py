@@ -139,7 +139,7 @@ def render_program_data_tables(filters):
     state_data = fetch_dataframe(
         f"""
         SELECT
-            state_name,
+            state_name, sum(started) AS started, sum(in_progress) AS in_progress, sum(submitted) AS submitted,
             sum(coalesce(total_triggered, started + in_progress + submitted)) AS total_triggered
         FROM program_data
         {clause}
@@ -155,7 +155,7 @@ def render_program_data_tables(filters):
         f"""
         SELECT
             state_name,
-            program_name,
+            program_name, sum(started) AS started, sum(in_progress) AS in_progress, sum(submitted) AS submitted,
             sum(coalesce(total_triggered, started + in_progress + submitted)) AS total_triggered
         FROM program_data
         {clause}
@@ -172,6 +172,9 @@ def render_program_data_tables(filters):
         SELECT
             state_name,
             district_name,
+            sum(started) AS started,
+            sum(in_progress) AS in_progress,
+            sum(submitted) AS submitted,
             sum(coalesce(total_triggered, started + in_progress + submitted)) AS total_triggered
         FROM program_data
         {clause}
@@ -188,7 +191,7 @@ def render_program_data_tables(filters):
         SELECT
             state_name,
             district_name,
-            program_name,
+            program_name, sum(started) AS started, sum(in_progress) AS in_progress, sum(submitted) AS submitted,
             sum(coalesce(total_triggered, started + in_progress + submitted)) AS total_triggered
         FROM program_data
         {clause}
@@ -268,9 +271,9 @@ def render_project_status_tables(filters):
             round((pc.submitted_count::numeric / nullif(pc.triggered_count, 0)) * 100, 2) AS completion_rate
         FROM project_counts pc
         LEFT JOIN target_numbers tn
-          ON lower(tn.state_name) = lower(pc.state_name)
-         AND lower(tn.program_name) = lower(pc.program_name)
-         AND lower(trim(tn.project_title)) = lower(trim(pc.project_title))
+          ON lower(pc.state_name)=lower(tn.state_name)
+         AND lower(pc.program_name)=lower(tn.program_name)
+         AND lower(trim(pc.project_title)) = lower(trim(tn.project_title))
         ORDER BY pc.state_name, pc.program_name, pc.project_title;
         """,
         rate_params,
@@ -278,17 +281,82 @@ def render_project_status_tables(filters):
     st.write("Project/Cycle/Program adoption and completion rate")
     st.dataframe(rates, use_container_width=True, hide_index=True)
 
+    overall_active_users = fetch_dataframe(
+        f"""
+        WITH user_project_counts AS (
+            SELECT
+                declared_state AS state_name,
+                user_uuid,
+                count(DISTINCT project_id) AS projects_consumed
+            FROM project_statuses
+            {base_clause}
+            {'AND' if base_clause else 'WHERE'} user_uuid IS NOT NULL
+            GROUP BY declared_state, user_uuid
+        ),
+        state_totals AS (
+            SELECT
+                state_name,
+                'Overall' AS projects_consumed,
+                count(*) AS count_of_uuid,
+                0 AS sort_order,
+                NULL::bigint AS project_sort
+            FROM user_project_counts
+            GROUP BY state_name
+        ),
+        consumption_counts AS (
+            SELECT
+                state_name,
+                projects_consumed::text AS projects_consumed,
+                count(*) AS count_of_uuid,
+                1 AS sort_order,
+                projects_consumed AS project_sort
+            FROM user_project_counts
+            GROUP BY state_name, projects_consumed
+        )
+        SELECT
+            state_name,
+            projects_consumed,
+            count_of_uuid
+        FROM (
+            SELECT * FROM state_totals
+            UNION ALL
+            SELECT * FROM consumption_counts
+        ) active_users
+        ORDER BY state_name, sort_order, project_sort;
+        """,
+        params,
+    )
+    st.write("Overall Active users")
+    st.dataframe(overall_active_users, use_container_width=True, hide_index=True)
+
     active_leaders = fetch_dataframe(
         f"""
+        WITH user_project_counts AS (
+            SELECT
+                extract(year from project_start_date_user)::int AS year,
+                extract(quarter from project_start_date_user)::int AS quarter,
+                user_uuid,
+                count(DISTINCT project_id) AS projects_consumed
+            FROM project_statuses
+            {base_clause}
+            {'AND' if base_clause else 'WHERE'} project_start_date_user IS NOT NULL
+            GROUP BY
+                extract(year from project_start_date_user),
+                extract(quarter from project_start_date_user),
+                user_uuid
+        )
         SELECT
-            extract(year from project_start_date_user)::int AS year,
-            extract(quarter from project_start_date_user)::int AS quarter,
-            count(DISTINCT user_uuid) AS active_leaders
-        FROM project_statuses
-        {base_clause}
-        {'AND' if base_clause else 'WHERE'} project_start_date_user IS NOT NULL
-        GROUP BY year, quarter
-        ORDER BY year, quarter;
+            year,
+            quarter,
+            count(*) AS active_leaders
+        FROM user_project_counts
+        WHERE projects_consumed >= 2
+        GROUP BY
+            year,
+            quarter
+        ORDER BY
+            year,
+            quarter;
         """,
         params,
     )
