@@ -3,7 +3,6 @@ from contextlib import contextmanager
 
 import pandas as pd
 import psycopg2
-import streamlit as st
 
 from dotenv import load_dotenv
 from psycopg2.extras import RealDictCursor
@@ -15,8 +14,8 @@ def get_database_url():
     return os.getenv("DATABASE_URL")
 
 
-@st.cache_resource
-def get_cached_connection():
+@contextmanager
+def get_connection():
     database_url = get_database_url()
 
     if not database_url:
@@ -24,18 +23,18 @@ def get_cached_connection():
             "DATABASE_URL is not configured."
         )
 
-    return psycopg2.connect(database_url)
-
-
-@contextmanager
-def get_connection():
-    connection = get_cached_connection()
+    connection = psycopg2.connect(database_url)
 
     try:
         yield connection
+        connection.commit()
+
     except Exception:
         connection.rollback()
         raise
+
+    finally:
+        connection.close()
 
 
 def authenticate(username, password):

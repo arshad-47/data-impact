@@ -350,7 +350,7 @@ def render_project_status_tables(filters):
             quarter,
             count(*) AS active_leaders
         FROM user_project_counts
-        WHERE projects_consumed >= 2
+        WHERE projects_consumed >= 4
         GROUP BY
             year,
             quarter
