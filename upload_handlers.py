@@ -444,7 +444,6 @@ def process_historical_before_upload(dataframe, file_name, upload_type, user):
                         lower(state_name),
                         lower(coalesce(district_name, ''))
                     FROM program_data
-                    WHERE historical_program = TRUE
                     """
                 )
 
