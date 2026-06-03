@@ -554,10 +554,30 @@ def process_historical_after_upload(dataframe, file_name, upload_type, user):
     stats = base_stats("repeteed_programs_skipped")
     stats["total_rows_in_csv"] = len(dataframe)
     failed_rows = []
+    rows_to_insert = []
 
     with get_connection() as connection:
         with connection:
             with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        lower(program_name),
+                        lower(state_name),
+                        lower(coalesce(district_name, ''))
+                    FROM program_data
+                    """
+                )
+                
+                existing_programs_district = {
+                    (row[0], row[1], row[2])
+                    for row in cursor.fetchall()
+                }
+                
+                existing_programs_state = {
+                    (k[0], k[1]) for k in existing_programs_district
+                }
+
                 for index, row in dataframe.iterrows():
                     row_number = index + 2
                     program_name = clean_string(row.get("Program Name"))
@@ -582,63 +602,55 @@ def process_historical_after_upload(dataframe, file_name, upload_type, user):
 
                     # Smarter duplicate check to avoid double-counting
                     if district:
-                        # If row has a district, only skip if this specific district is already saved
-                        cursor.execute(
-                            """
-                            SELECT 1 FROM program_data
-                            WHERE lower(program_name) = lower(%s)
-                              AND lower(state_name) = lower(%s)
-                              AND lower(district_name) = lower(%s)
-                            LIMIT 1;
-                            """,
-                            (program_name, state, district)
-                        )
+                        lookup_key = (program_name.lower(), state.lower(), district.lower())
+                        if lookup_key in existing_programs_district:
+                            stats["repeteed_programs_skipped"] += 1
+                            continue
+                        existing_programs_district.add(lookup_key)
+                        existing_programs_state.add((program_name.lower(), state.lower()))
                     else:
                         # If row has NO district (it's a state rollup), skip if WE HAVE ANY DATA 
                         # for this program+state (either district data from 'Before VAM' or a previous state rollup)
-                        cursor.execute(
-                            """
-                            SELECT 1 FROM program_data
-                            WHERE lower(program_name) = lower(%s)
-                              AND lower(state_name) = lower(%s)
-                            LIMIT 1;
-                            """,
-                            (program_name, state)
+                        lookup_key = (program_name.lower(), state.lower())
+                        if lookup_key in existing_programs_state:
+                            stats["repeteed_programs_skipped"] += 1
+                            continue
+                        existing_programs_district.add((program_name.lower(), state.lower(), ""))
+                        existing_programs_state.add(lookup_key)
+
+                    rows_to_insert.append(
+                        (
+                            program_name,
+                            state,
+                            district,
+                            started,
+                            in_progress,
+                            submitted,
+                            submitted_with_evidence,
+                            total_triggered,
                         )
+                    )
+                    stats["sucessfully_insereted"] += 1
 
-                    if cursor.fetchone() is not None:
-                        stats["repeteed_programs_skipped"] += 1
-                        continue
-
-                    begin_row_savepoint(cursor)
-                    try:
-                        cursor.execute(
-                            """
-                            INSERT INTO program_data (
-                                program_name, state_name, district_name, started,
-                                in_progress, submitted, submitted_with_evidence,
-                                total_triggered, historical_program
-                            )
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, FALSE);
-                            """,
+                if rows_to_insert:
+                    execute_values(
+                        cursor,
+                        """
+                        INSERT INTO program_data (
+                            program_name, state_name, district_name, started,
+                            in_progress, submitted, submitted_with_evidence,
+                            total_triggered, historical_program
+                        )
+                        VALUES %s
+                        """,
+                        [
                             (
-                                program_name,
-                                state,
-                                district,
-                                started,
-                                in_progress,
-                                submitted,
-                                submitted_with_evidence,
-                                total_triggered,
-                            ),
-                        )
-                    except Exception as exc:
-                        rollback_row_savepoint(cursor)
-                        failed_rows.append({"row_number": row_number, "row_data": row.to_dict(), "reason": str(exc)})
-                        stats["failed_insertion"] += 1
-                    else:
-                        release_row_savepoint(cursor)
-                        stats["sucessfully_insereted"] += 1
+                                r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], False
+                            )
+                            for r in rows_to_insert
+                        ],
+                        page_size=1000,
+                    )
 
                 update_historical_program_flags(cursor)
                 record_upload(cursor, user, upload_type, file_name, upload_status(failed_rows), stats, failed_rows)
