@@ -64,7 +64,6 @@ HISTORICAL_AFTER_REQUIRED_COLUMNS = [
     "Started",
     "In-Progress",
     "Submitted",
-    "Submitted projects with evidence",
     "Total Triggered",
 ]
 
@@ -563,6 +562,7 @@ def process_historical_after_upload(dataframe, file_name, upload_type, user):
                     row_number = index + 2
                     program_name = clean_string(row.get("Program Name"))
                     state = clean_string(row.get("State Name"))
+                    district = clean_string(row.get("District Name"))
                     started = clean_int(row.get("Started"))
                     in_progress = clean_int(row.get("In-Progress"))
                     submitted = clean_int(row.get("Submitted"))
@@ -580,7 +580,33 @@ def process_historical_after_upload(dataframe, file_name, upload_type, user):
                         stats["failed_insertion"] += 1
                         continue
 
-                    if program_data_exists(cursor, program_name, state, None, False):
+                    # Smarter duplicate check to avoid double-counting
+                    if district:
+                        # If row has a district, only skip if this specific district is already saved
+                        cursor.execute(
+                            """
+                            SELECT 1 FROM program_data
+                            WHERE lower(program_name) = lower(%s)
+                              AND lower(state_name) = lower(%s)
+                              AND lower(district_name) = lower(%s)
+                            LIMIT 1;
+                            """,
+                            (program_name, state, district)
+                        )
+                    else:
+                        # If row has NO district (it's a state rollup), skip if WE HAVE ANY DATA 
+                        # for this program+state (either district data from 'Before VAM' or a previous state rollup)
+                        cursor.execute(
+                            """
+                            SELECT 1 FROM program_data
+                            WHERE lower(program_name) = lower(%s)
+                              AND lower(state_name) = lower(%s)
+                            LIMIT 1;
+                            """,
+                            (program_name, state)
+                        )
+
+                    if cursor.fetchone() is not None:
                         stats["repeteed_programs_skipped"] += 1
                         continue
 
@@ -593,11 +619,12 @@ def process_historical_after_upload(dataframe, file_name, upload_type, user):
                                 in_progress, submitted, submitted_with_evidence,
                                 total_triggered, historical_program
                             )
-                            VALUES (%s, %s, NULL, %s, %s, %s, %s, %s, FALSE);
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, FALSE);
                             """,
                             (
                                 program_name,
                                 state,
+                                district,
                                 started,
                                 in_progress,
                                 submitted,
