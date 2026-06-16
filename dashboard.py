@@ -244,13 +244,15 @@ def render_project_status_tables(filters):
         SELECT
             date_trunc('month', project_start_date_user)::date AS month,
             program_name,
-            project_status,
-            count(*) AS triggered_count
+            count(*) filter (where lower(project_status) = 'started') AS started,
+            count(*) filter (where lower(project_status) = 'in_progress') AS in_progress,
+            count(*) filter (where lower(project_status) = 'submitted') AS submitted,
+            count(*) AS total_triggered
         FROM project_statuses
         {base_clause}
         {'AND' if base_clause else 'WHERE'} extract(year from project_start_date_user) = %s
-        GROUP BY month, program_name, project_status
-        ORDER BY month, program_name, project_status;
+        GROUP BY month, program_name
+        ORDER BY month, program_name;
         """,
         params + [selected_year],
     )
@@ -298,7 +300,10 @@ def render_project_status_tables(filters):
         rate_params,
     )
     st.write("Project/Cycle/Program adoption and completion rate")
-    st.dataframe(rates, use_container_width=True, hide_index=True)
+    display_rates = rates.copy()
+    display_rates['adoption_rate'] = display_rates['adoption_rate'].apply(lambda x: f"{x:.2f}%" if pd.notna(x) else x)
+    display_rates['completion_rate'] = display_rates['completion_rate'].apply(lambda x: f"{x:.2f}%" if pd.notna(x) else x)
+    st.dataframe(display_rates, use_container_width=True, hide_index=True)
 
     if not rates.empty:
         import plotly.express as px
