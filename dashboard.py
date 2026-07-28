@@ -4,7 +4,7 @@ import streamlit as st
 from db import fetch_dataframe
 
 
-def add_optional_filters(where_parts, params, filters, table_alias=""):
+def add_optional_filters(where_parts, params, filters, table_alias="", supports_year=False):
     prefix = f"{table_alias}." if table_alias else ""
 
     if filters.get("vam") == "Pre VAM":
@@ -17,12 +17,23 @@ def add_optional_filters(where_parts, params, filters, table_alias=""):
         params.append(filters["program_name"])
 
     if filters.get("state"):
-        where_parts.append(f"{prefix}state_name = %s")
+        # map state to declared_state for project_statuses if supports_year is true
+        if supports_year:
+            where_parts.append(f"{prefix}declared_state = %s")
+        else:
+            where_parts.append(f"{prefix}state_name = %s")
         params.append(filters["state"])
 
     if filters.get("district"):
-        where_parts.append(f"{prefix}district_name = %s")
+        if supports_year:
+            where_parts.append(f"{prefix}district = %s")
+        else:
+            where_parts.append(f"{prefix}district_name = %s")
         params.append(filters["district"])
+        
+    if supports_year and filters.get("year"):
+        where_parts.append(f"extract(year from {prefix}project_start_date_user) = %s")
+        params.append(filters["year"])
 
 
 def where_clause(where_parts):
@@ -114,21 +125,37 @@ def render_dashboard():
 def render_metric_cards(filters):
     where_parts = []
     params = []
-    add_optional_filters(where_parts, params, filters)
-    clause = where_clause(where_parts)
-
-    data = fetch_dataframe(
-        f"""
-        SELECT
-            coalesce(sum(coalesce(total_triggered, started + in_progress + submitted)), 0) AS total_triggered,
-            coalesce(sum(started), 0) AS started,
-            coalesce(sum(in_progress), 0) AS in_progress,
-            coalesce(sum(submitted), 0) AS submitted
-        FROM program_data
-        {clause};
-        """,
-        params,
-    )
+    
+    if filters.get("year"):
+        add_optional_filters(where_parts, params, filters, supports_year=True)
+        clause = where_clause(where_parts)
+        data = fetch_dataframe(
+            f"""
+            SELECT
+                count(*) AS total_triggered,
+                count(*) filter (where lower(project_status) = 'started') AS started,
+                count(*) filter (where lower(project_status) = 'in_progress') AS in_progress,
+                count(*) filter (where lower(project_status) = 'submitted') AS submitted
+            FROM project_statuses
+            {clause};
+            """,
+            params,
+        )
+    else:
+        add_optional_filters(where_parts, params, filters)
+        clause = where_clause(where_parts)
+        data = fetch_dataframe(
+            f"""
+            SELECT
+                coalesce(sum(coalesce(total_triggered, started + in_progress + submitted)), 0) AS total_triggered,
+                coalesce(sum(started), 0) AS started,
+                coalesce(sum(in_progress), 0) AS in_progress,
+                coalesce(sum(submitted), 0) AS submitted
+            FROM program_data
+            {clause};
+            """,
+            params,
+        )
 
     row = data.iloc[0]
     col1, col2, col3, col4 = st.columns(4)
@@ -143,17 +170,42 @@ def render_program_data_tables(filters):
 
     where_parts = []
     params = []
-    add_optional_filters(where_parts, params, filters)
-    clause = where_clause(where_parts)
+    
+    if filters.get("year"):
+        add_optional_filters(where_parts, params, filters, supports_year=True)
+        clause = where_clause(where_parts)
+        table = "project_statuses"
+        state_col = "declared_state AS state_name"
+        state_grp = "declared_state"
+        district_col = "district AS district_name"
+        district_grp = "district"
+        
+        started_expr = "count(*) filter (where lower(project_status) = 'started')"
+        in_progress_expr = "count(*) filter (where lower(project_status) = 'in_progress')"
+        submitted_expr = "count(*) filter (where lower(project_status) = 'submitted')"
+        total_expr = "count(*)"
+    else:
+        add_optional_filters(where_parts, params, filters)
+        clause = where_clause(where_parts)
+        table = "program_data"
+        state_col = "state_name"
+        state_grp = "state_name"
+        district_col = "district_name"
+        district_grp = "district_name"
+        
+        started_expr = "sum(started)"
+        in_progress_expr = "sum(in_progress)"
+        submitted_expr = "sum(submitted)"
+        total_expr = "sum(coalesce(total_triggered, started + in_progress + submitted))"
 
     state_data = fetch_dataframe(
         f"""
         SELECT
-            state_name, sum(started) AS started, sum(in_progress) AS in_progress, sum(submitted) AS submitted,
-            sum(coalesce(total_triggered, started + in_progress + submitted)) AS total_triggered
-        FROM program_data
+            {state_col}, {started_expr} AS started, {in_progress_expr} AS in_progress, {submitted_expr} AS submitted,
+            {total_expr} AS total_triggered
+        FROM {table}
         {clause}
-        GROUP BY state_name
+        GROUP BY {state_grp}
         ORDER BY total_triggered DESC;
         """,
         params,
@@ -164,13 +216,13 @@ def render_program_data_tables(filters):
     program_state_data = fetch_dataframe(
         f"""
         SELECT
-            state_name,
-            program_name, sum(started) AS started, sum(in_progress) AS in_progress, sum(submitted) AS submitted,
-            sum(coalesce(total_triggered, started + in_progress + submitted)) AS total_triggered
-        FROM program_data
+            {state_col},
+            program_name, {started_expr} AS started, {in_progress_expr} AS in_progress, {submitted_expr} AS submitted,
+            {total_expr} AS total_triggered
+        FROM {table}
         {clause}
-        GROUP BY state_name, program_name
-        ORDER BY state_name, total_triggered DESC;
+        GROUP BY {state_grp}, program_name
+        ORDER BY {state_grp}, total_triggered DESC;
         """,
         params,
     )
@@ -180,16 +232,16 @@ def render_program_data_tables(filters):
     district_data = fetch_dataframe(
         f"""
         SELECT
-            state_name,
-            district_name,
-            sum(started) AS started,
-            sum(in_progress) AS in_progress,
-            sum(submitted) AS submitted,
-            sum(coalesce(total_triggered, started + in_progress + submitted)) AS total_triggered
-        FROM program_data
+            {state_col},
+            {district_col},
+            {started_expr} AS started,
+            {in_progress_expr} AS in_progress,
+            {submitted_expr} AS submitted,
+            {total_expr} AS total_triggered
+        FROM {table}
         {clause}
-        GROUP BY state_name, district_name
-        ORDER BY state_name, total_triggered DESC;
+        GROUP BY {state_grp}, {district_grp}
+        ORDER BY {state_grp}, total_triggered DESC;
         """,
         params,
     )
@@ -199,14 +251,14 @@ def render_program_data_tables(filters):
     program_district_data = fetch_dataframe(
         f"""
         SELECT
-            state_name,
-            district_name,
-            program_name, sum(started) AS started, sum(in_progress) AS in_progress, sum(submitted) AS submitted,
-            sum(coalesce(total_triggered, started + in_progress + submitted)) AS total_triggered
-        FROM program_data
+            {state_col},
+            {district_col},
+            program_name, {started_expr} AS started, {in_progress_expr} AS in_progress, {submitted_expr} AS submitted,
+            {total_expr} AS total_triggered
+        FROM {table}
         {clause}
-        GROUP BY state_name, district_name, program_name
-        ORDER BY state_name, district_name, total_triggered DESC;
+        GROUP BY {state_grp}, {district_grp}, program_name
+        ORDER BY {state_grp}, {district_grp}, total_triggered DESC;
         """,
         params,
     )
