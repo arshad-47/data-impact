@@ -1,5 +1,6 @@
 import pandas as pd
 from psycopg2.extras import Json, execute_values
+import difflib
 
 from db import get_connection
 from utils import (
@@ -47,6 +48,7 @@ PROJECT_STATUS_REQUIRED_COLUMNS = [
     "Project Duration",
     "Project last Synced date",
     "Project Status",
+    # "Certificate Status",  # Optional, not present in all CSVs
 ]
 
 HISTORICAL_BEFORE_REQUIRED_COLUMNS = [
@@ -56,11 +58,14 @@ HISTORICAL_BEFORE_REQUIRED_COLUMNS = [
     "Started",
     "In-Progress",
     "Submitted",
+    "Submitted projects with evidence",
+    "Total Triggered",
 ]
 
 HISTORICAL_AFTER_REQUIRED_COLUMNS = [
     "Program Name",
     "State Name",
+    "District Name",
     "Started",
     "In-Progress",
     "Submitted",
@@ -96,7 +101,7 @@ def validate_upload(dataframe, upload_type):
 def base_stats(repeated_key):
     return {
         "total_rows_in_csv": 0,
-        "sucessfully_insereted": 0,
+        "successfully_inserted": 0,
         repeated_key: 0,
         "failed_insertion": 0,
     }
@@ -172,6 +177,19 @@ def process_upload(uploaded_file, upload_type, user):
 
 
 def process_project_status_upload(dataframe, file_name, upload_type, user):
+    if "Project Title" in dataframe.columns:
+        counts = dataframe["Project Title"].value_counts()
+        sorted_titles = [t for t in counts.index.tolist() if isinstance(t, str) and t.strip()]
+        mapping = {}
+        for i, title in enumerate(sorted_titles):
+            if title in mapping: continue
+            mapping[title] = title
+            for other_title in sorted_titles[i+1:]:
+                if other_title in mapping: continue
+                if difflib.SequenceMatcher(None, title.lower(), other_title.lower()).ratio() >= 0.9:
+                    mapping[other_title] = title
+        dataframe["Project Title"] = dataframe["Project Title"].map(lambda x: mapping.get(x, x))
+
     stats = base_stats("repeteed_projectids_skipped")
     stats["total_rows_in_csv"] = len(dataframe)
 
@@ -272,7 +290,7 @@ def process_project_status_upload(dataframe, file_name, upload_type, user):
                         )
                     )
 
-                    stats["sucessfully_insereted"] += 1
+                    stats["successfully_inserted"] += 1
 
                     group_key = (
                         program_name,
@@ -336,7 +354,6 @@ def process_project_status_upload(dataframe, file_name, upload_type, user):
 
 def upsert_program_aggregates(cursor, inserted_groups):
     for (program_name, state, district), counts in inserted_groups.items():
-        total = counts["started"] + counts["in_progress"] + counts["submitted"]
         cursor.execute(
             """
             SELECT program_id
@@ -344,7 +361,6 @@ def upsert_program_aggregates(cursor, inserted_groups):
             WHERE lower(program_name) = lower(%s)
               AND lower(state_name) = lower(%s)
               AND lower(coalesce(district_name, '')) = lower(coalesce(%s, ''))
-              AND historical_program = FALSE
             LIMIT 1;
             """,
             (program_name, state, district),
@@ -352,18 +368,26 @@ def upsert_program_aggregates(cursor, inserted_groups):
         existing = cursor.fetchone()
 
         if existing:
+            total_new = counts.get("started", 0) + counts.get("in_progress", 0) + counts.get("submitted", 0)
             cursor.execute(
                 """
                 UPDATE program_data
                 SET started = coalesce(started, 0) + %s,
                     in_progress = coalesce(in_progress, 0) + %s,
                     submitted = coalesce(submitted, 0) + %s,
-                    total_triggered = coalesce(total_triggered, 0) + %s
+                    total_triggered = coalesce(total_triggered, coalesce(started, 0) + coalesce(in_progress, 0) + coalesce(submitted, 0)) + %s
                 WHERE program_id = %s;
                 """,
-                (counts["started"], counts["in_progress"], counts["submitted"], total, existing[0]),
+                (
+                    counts.get("started", 0),
+                    counts.get("in_progress", 0),
+                    counts.get("submitted", 0),
+                    total_new,
+                    existing[0]
+                ),
             )
         else:
+            total = counts["started"] + counts["in_progress"] + counts["submitted"]
             cursor.execute(
                 """
                 INSERT INTO program_data (
@@ -435,26 +459,6 @@ def process_historical_before_upload(dataframe, file_name, upload_type, user):
     with get_connection() as connection:
         with connection:
             with connection.cursor() as cursor:
-
-                cursor.execute(
-                    """
-                    SELECT
-                        lower(program_name),
-                        lower(state_name),
-                        lower(coalesce(district_name, ''))
-                    FROM program_data
-                    """
-                )
-
-                existing_programs = {
-                    (
-                        row[0],
-                        row[1],
-                        row[2]
-                    )
-                    for row in cursor.fetchall()
-                }
-
                 for index, row in dataframe.iterrows():
                     row_number = index + 2
                     program_name = clean_string(row.get("Program Name"))
@@ -463,6 +467,8 @@ def process_historical_before_upload(dataframe, file_name, upload_type, user):
                     started = clean_int(row.get("Started"))
                     in_progress = clean_int(row.get("In-Progress"))
                     submitted = clean_int(row.get("Submitted"))
+                    submitted_with_evidence = clean_int(row.get("Submitted projects with evidence"))
+                    total_triggered = clean_int(row.get("Total Triggered"))
 
                     if not program_name or not state:
                         failed_rows.append(
@@ -478,27 +484,56 @@ def process_historical_before_upload(dataframe, file_name, upload_type, user):
                         stats["failed_insertion"] += 1
                         continue
 
-                    lookup_key = (
-                        program_name.lower(),
-                        state.lower(),
-                        (district or "").lower()
-                    )
-
-                    if lookup_key in existing_programs:
-                        stats["repeteed_programs_skipped"] += 1
-                        continue
-
-                    existing_programs.add(lookup_key)
-
                     rows_to_insert.append(
                         (
                             program_name,state,district,
                             started,in_progress, submitted,
-                            started + in_progress + submitted,
+                            submitted_with_evidence, total_triggered,
                         )
                     )
 
-                    stats["sucessfully_insereted"] += 1
+                    stats["successfully_inserted"] += 1
+
+                # Deduplicate state-level vs district-level records to prevent number inflation
+                if rows_to_insert:
+                    districts_to_add = set()
+                    for r in rows_to_insert:
+                        if r[2]:  # district is not empty
+                            districts_to_add.add((r[0], r[1]))
+                    
+                    # 1. Delete state-level (empty district) records if we are adding district-level records
+                    for prog, st in districts_to_add:
+                        cursor.execute(
+                            """
+                            DELETE FROM program_data
+                            WHERE lower(program_name) = lower(%s)
+                              AND lower(state_name) = lower(%s)
+                              AND (district_name IS NULL OR trim(district_name) = '')
+                            """,
+                            (prog, st)
+                        )
+
+                    # 2. Skip inserting state-level records if district-level records exist
+                    filtered_rows = []
+                    for r in rows_to_insert:
+                        prog, st, dist = r[0], r[1], r[2]
+                        if not dist:
+                            cursor.execute(
+                                """
+                                SELECT 1 FROM program_data
+                                WHERE lower(program_name) = lower(%s)
+                                  AND lower(state_name) = lower(%s)
+                                  AND (district_name IS NOT NULL AND trim(district_name) != '')
+                                LIMIT 1
+                                """,
+                                (prog, st)
+                            )
+                            has_districts_in_db = cursor.fetchone() is not None
+                            if has_districts_in_db or (prog, st) in districts_to_add:
+                                continue  # Skip to avoid duplication
+                        filtered_rows.append(r)
+                    
+                    rows_to_insert = filtered_rows
 
                 # Bulk insert
                 if rows_to_insert:
@@ -517,6 +552,12 @@ def process_historical_before_upload(dataframe, file_name, upload_type, user):
                             historical_program
                         )
                         VALUES %s
+                        ON CONFLICT (lower(program_name), lower(state_name), lower(coalesce(district_name, ''))) DO UPDATE SET
+                            started = EXCLUDED.started,
+                            in_progress = EXCLUDED.in_progress,
+                            submitted = EXCLUDED.submitted,
+                            submitted_with_evidence = EXCLUDED.submitted_with_evidence,
+                            total_triggered = EXCLUDED.total_triggered;
                         """,
                         [
                             (
@@ -526,9 +567,9 @@ def process_historical_before_upload(dataframe, file_name, upload_type, user):
                                 row[3],   # started
                                 row[4],   # in_progress
                                 row[5],   # submitted
-                                None,
-                                row[6],   # total_triggered
-                                True
+                                row[6],   # submitted_with_evidence
+                                row[7],   # total_triggered
+                                True      # historical_program
                             )
                             for row in rows_to_insert
                         ],
@@ -559,24 +600,7 @@ def process_historical_after_upload(dataframe, file_name, upload_type, user):
     with get_connection() as connection:
         with connection:
             with connection.cursor() as cursor:
-                cursor.execute(
-                    """
-                    SELECT
-                        lower(program_name),
-                        lower(state_name),
-                        lower(coalesce(district_name, ''))
-                    FROM program_data
-                    """
-                )
-                
-                existing_programs_district = {
-                    (row[0], row[1], row[2])
-                    for row in cursor.fetchall()
-                }
-                
-                existing_programs_state = {
-                    (k[0], k[1]) for k in existing_programs_district
-                }
+                # Duplicate checking relies on ON CONFLICT DO UPDATE below
 
                 for index, row in dataframe.iterrows():
                     row_number = index + 2
@@ -586,7 +610,13 @@ def process_historical_after_upload(dataframe, file_name, upload_type, user):
                     started = clean_int(row.get("Started"))
                     in_progress = clean_int(row.get("In-Progress"))
                     submitted = clean_int(row.get("Submitted"))
-                    submitted_with_evidence = clean_int(row.get("Submitted projects with evidence"))
+                    
+                    # After-VAM CSV doesn't have Submitted with evidence column
+                    # But we use clean_int which will default to 0 if missing. We'll pass None explicitly.
+                    submitted_with_evidence = clean_int(row.get("Submitted projects with evidence", "0"))
+                    if not row.get("Submitted projects with evidence"):
+                        submitted_with_evidence = None
+
                     total_triggered = clean_int(row.get("Total Triggered"))
 
                     if not program_name or not state:
@@ -600,24 +630,6 @@ def process_historical_after_upload(dataframe, file_name, upload_type, user):
                         stats["failed_insertion"] += 1
                         continue
 
-                    # Smarter duplicate check to avoid double-counting
-                    if district:
-                        lookup_key = (program_name.lower(), state.lower(), district.lower())
-                        if lookup_key in existing_programs_district:
-                            stats["repeteed_programs_skipped"] += 1
-                            continue
-                        existing_programs_district.add(lookup_key)
-                        existing_programs_state.add((program_name.lower(), state.lower()))
-                    else:
-                        # If row has NO district (it's a state rollup), skip if WE HAVE ANY DATA 
-                        # for this program+state (either district data from 'Before VAM' or a previous state rollup)
-                        lookup_key = (program_name.lower(), state.lower())
-                        if lookup_key in existing_programs_state:
-                            stats["repeteed_programs_skipped"] += 1
-                            continue
-                        existing_programs_district.add((program_name.lower(), state.lower(), ""))
-                        existing_programs_state.add(lookup_key)
-
                     rows_to_insert.append(
                         (
                             program_name,
@@ -630,7 +642,48 @@ def process_historical_after_upload(dataframe, file_name, upload_type, user):
                             total_triggered,
                         )
                     )
-                    stats["sucessfully_insereted"] += 1
+                    stats["successfully_inserted"] += 1
+
+                # Deduplicate state-level vs district-level records to prevent number inflation
+                if rows_to_insert:
+                    districts_to_add = set()
+                    for r in rows_to_insert:
+                        if r[2]:  # district is not empty
+                            districts_to_add.add((r[0], r[1]))
+                    
+                    # 1. Delete state-level (empty district) records if we are adding district-level records
+                    for prog, st in districts_to_add:
+                        cursor.execute(
+                            """
+                            DELETE FROM program_data
+                            WHERE lower(program_name) = lower(%s)
+                              AND lower(state_name) = lower(%s)
+                              AND (district_name IS NULL OR trim(district_name) = '')
+                            """,
+                            (prog, st)
+                        )
+
+                    # 2. Skip inserting state-level records if district-level records exist
+                    filtered_rows = []
+                    for r in rows_to_insert:
+                        prog, st, dist = r[0], r[1], r[2]
+                        if not dist:
+                            cursor.execute(
+                                """
+                                SELECT 1 FROM program_data
+                                WHERE lower(program_name) = lower(%s)
+                                  AND lower(state_name) = lower(%s)
+                                  AND (district_name IS NOT NULL AND trim(district_name) != '')
+                                LIMIT 1
+                                """,
+                                (prog, st)
+                            )
+                            has_districts_in_db = cursor.fetchone() is not None
+                            if has_districts_in_db or (prog, st) in districts_to_add:
+                                continue  # Skip to avoid duplication
+                        filtered_rows.append(r)
+                    
+                    rows_to_insert = filtered_rows
 
                 if rows_to_insert:
                     execute_values(
@@ -642,6 +695,12 @@ def process_historical_after_upload(dataframe, file_name, upload_type, user):
                             total_triggered, historical_program
                         )
                         VALUES %s
+                        ON CONFLICT (lower(program_name), lower(state_name), lower(coalesce(district_name, ''))) DO UPDATE SET
+                            started = EXCLUDED.started,
+                            in_progress = EXCLUDED.in_progress,
+                            submitted = EXCLUDED.submitted,
+                            submitted_with_evidence = EXCLUDED.submitted_with_evidence,
+                            total_triggered = EXCLUDED.total_triggered;
                         """,
                         [
                             (
@@ -724,7 +783,7 @@ def process_target_numbers_upload(dataframe, file_name, upload_type, user):
                         stats["failed_insertion"] += 1
                     else:
                         release_row_savepoint(cursor)
-                        stats["sucessfully_insereted"] += 1
+                        stats["successfully_inserted"] += 1
 
                 record_upload(cursor, user, upload_type, file_name, upload_status(failed_rows), stats, failed_rows)
 

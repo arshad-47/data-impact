@@ -345,8 +345,18 @@ def render_project_status_tables(filters):
         plot_rates = plot_rates.sort_values("adoption_rate", ascending=True)
         # Truncate long titles for display
         # Prefix with cycle so same-title projects in different cycles get unique labels
-        cycle_prefix = plot_rates["cycle"].apply(lambda c: f"[{c}] " if pd.notna(c) else "")
-        plot_rates["short_title"] = cycle_prefix + plot_rates["project_title"].str.slice(0, 40) + plot_rates["project_title"].apply(lambda x: "…" if len(str(x)) > 40 else "")
+        short_titles = []
+        for _, row in plot_rates.iterrows():
+            c = row.get("cycle")
+            if isinstance(c, pd.Series): c = c.iloc[0]
+            t = row.get("project_title")
+            if isinstance(t, pd.Series): t = t.iloc[0]
+            
+            prefix = f"[{c}] " if pd.notna(c) else ""
+            title_str = str(t)
+            short_titles.append(prefix + title_str[:40] + ("…" if len(title_str) > 40 else ""))
+            
+        plot_rates["short_title"] = short_titles
 
         fig1 = go.Figure()
         fig1.add_trace(go.Bar(

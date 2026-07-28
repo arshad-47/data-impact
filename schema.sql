@@ -75,8 +75,7 @@ CREATE UNIQUE INDEX idx_program_data_unique_program_scope
 ON program_data (
     lower(program_name),
     lower(state_name),
-    lower(coalesce(district_name, '')),
-    historical_program
+    lower(coalesce(district_name, ''))
 );
 
 
