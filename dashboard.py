@@ -210,6 +210,37 @@ def render_program_data_tables(filters):
         """,
         params,
     )
+
+    ps_where = []
+    ps_params = []
+    if filters.get("year"):
+        ps_where.append("extract(year from project_start_date_user) = %s")
+        ps_params.append(filters["year"])
+    if filters.get("program_name"):
+        ps_where.append("program_name = %s")
+        ps_params.append(filters["program_name"])
+    if filters.get("state"):
+        ps_where.append("declared_state = %s")
+        ps_params.append(filters["state"])
+    if filters.get("district"):
+        ps_where.append("district = %s")
+        ps_params.append(filters["district"])
+    
+    ps_clause = where_clause(ps_where)
+    
+    unique_state = fetch_dataframe(
+        f"""
+        SELECT declared_state AS state_name, count(distinct user_uuid) AS overall_unique_users
+        FROM project_statuses
+        {ps_clause}
+        GROUP BY declared_state
+        """,
+        ps_params,
+    )
+    
+    state_data = state_data.merge(unique_state, on="state_name", how="left")
+    state_data["overall_unique_users"] = state_data["overall_unique_users"].fillna(0).astype(int)
+
     st.write("State wise overall cumulative MI triggered")
     st.dataframe(state_data, use_container_width=True, hide_index=True)
 
@@ -226,6 +257,20 @@ def render_program_data_tables(filters):
         """,
         params,
     )
+
+    unique_prog_state = fetch_dataframe(
+        f"""
+        SELECT declared_state AS state_name, program_name, count(distinct user_uuid) AS overall_unique_users
+        FROM project_statuses
+        {ps_clause}
+        GROUP BY declared_state, program_name
+        """,
+        ps_params,
+    )
+    
+    program_state_data = program_state_data.merge(unique_prog_state, on=["state_name", "program_name"], how="left")
+    program_state_data["overall_unique_users"] = program_state_data["overall_unique_users"].fillna(0).astype(int)
+
     st.write("Program wise cumulative MI triggered at state level")
     st.dataframe(program_state_data, use_container_width=True, hide_index=True)
 
@@ -293,20 +338,52 @@ def render_project_status_tables(filters):
     selected_year = filters.get("year") or 2026
     month_data = fetch_dataframe(
         f"""
-        SELECT
-            date_trunc('month', project_start_date_user)::date AS month,
-            program_name,
-            count(*) filter (where lower(project_status) = 'started') AS started,
-            count(*) filter (where lower(project_status) = 'in_progress') AS in_progress,
-            count(*) filter (where lower(project_status) = 'submitted') AS submitted,
-            count(*) AS total_triggered
-        FROM project_statuses
-        {base_clause}
-        {'AND' if base_clause else 'WHERE'} extract(year from project_start_date_user) = %s
-        GROUP BY month, program_name
-        ORDER BY month, program_name;
+        WITH month_agg AS (
+            SELECT
+                date_trunc('month', project_start_date_user)::date AS month,
+                program_name,
+                count(*) filter (where lower(project_status) = 'started') AS started,
+                count(*) filter (where lower(project_status) = 'in_progress') AS in_progress,
+                count(*) filter (where lower(project_status) = 'submitted') AS submitted,
+                count(*) AS total_triggered,
+                count(distinct user_uuid) AS monthly_unique_users
+            FROM project_statuses
+            {base_clause}
+            {'AND' if base_clause else 'WHERE'} extract(year from project_start_date_user) = %s
+            GROUP BY month, program_name
+        ),
+        user_first_month AS (
+            SELECT 
+                program_name,
+                user_uuid,
+                date_trunc('month', MIN(project_start_date_user))::date AS first_month
+            FROM project_statuses
+            {base_clause}
+            GROUP BY program_name, user_uuid
+        ),
+        new_users_agg AS (
+            SELECT 
+                program_name,
+                first_month AS month,
+                count(distinct user_uuid) AS monthly_new_users
+            FROM user_first_month
+            WHERE extract(year from first_month) = %s
+            GROUP BY program_name, first_month
+        )
+        SELECT 
+            m.month,
+            m.program_name,
+            m.started,
+            m.in_progress,
+            m.submitted,
+            m.total_triggered,
+            m.monthly_unique_users,
+            coalesce(n.monthly_new_users, 0) AS monthly_new_users
+        FROM month_agg m
+        LEFT JOIN new_users_agg n ON m.program_name = n.program_name AND m.month = n.month
+        ORDER BY m.month, m.program_name;
         """,
-        params + [selected_year],
+        params + [selected_year] + params + [selected_year],
     )
     st.write(f"Month wise cumulative MI triggered for {selected_year} programs")
     st.dataframe(month_data, use_container_width=True, hide_index=True)
